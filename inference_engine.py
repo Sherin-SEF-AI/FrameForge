@@ -312,10 +312,6 @@ class InferenceEngine:
                 binary = (mask_resized > 0.5).astype(np.uint8) * 255
                 masks_binary.append(binary)
 
-        # Optimisation 5: release CUDA cache after every inference call
-        if TORCH_AVAILABLE and self._device == "cuda":
-            torch.cuda.empty_cache()
-
         return InferenceResult(
             boxes_xyxy=boxes_xyxy,
             class_ids=class_ids,
@@ -352,21 +348,23 @@ class InferenceEngine:
         np.ndarray
             Annotated BGR frame (a new array; the original is untouched).
         """
-        annotated = frame_bgr.copy().astype(np.float32)
+        annotated = frame_bgr.copy()
 
-        # Pass 1: alpha-blend masks (only within mask region)
+        # Pass 1: alpha-blend masks — stay in uint8 to avoid float32 copy
         for i, mask in enumerate(result.masks_binary):
             if i >= len(result.class_ids):
                 break
-            color = _PALETTE[result.class_ids[i] % len(_PALETTE)]
-            color_array = np.array(color, dtype=np.float32)
+            color     = _PALETTE[result.class_ids[i] % len(_PALETTE)]
             mask_bool = mask > 0
-            # Blend: out = src * (1 - alpha) + color * alpha
+            if not mask_bool.any():
+                continue
+            # cv2.addWeighted on the masked region only
+            color_layer          = np.empty_like(annotated)
+            color_layer[:]       = color
+            region               = annotated[mask_bool]
             annotated[mask_bool] = (
-                annotated[mask_bool] * 0.55 + color_array * 0.45
-            )
-
-        annotated = annotated.clip(0, 255).astype(np.uint8)
+                (region.astype(np.uint16) * 55 + np.array(color, dtype=np.uint16) * 45) // 100
+            ).astype(np.uint8)
 
         # Pass 2: draw bounding boxes and labels on top
         for i, box in enumerate(result.boxes_xyxy):
@@ -998,10 +996,14 @@ class SemanticSegmentationEngine:
 
             logger.info("Loading SegFormer (%s) on %s …", model_id, dev)
             self._processor = AutoImageProcessor.from_pretrained(model_id)
-            self._model     = SegformerForSemanticSegmentation.from_pretrained(
+            self._model = SegformerForSemanticSegmentation.from_pretrained(
                 model_id
             ).to(dev)
             self._model.eval()
+            # FP16 on GPU — halves VRAM and roughly doubles throughput
+            if dev == "cuda":
+                self._model = self._model.half()
+            self._fp16 = (dev == "cuda")
 
             # Extract class names from model config
             cfg = self._model.config
@@ -1051,16 +1053,37 @@ class SemanticSegmentationEngine:
         import torch.nn.functional as F
 
         orig_h, orig_w = frame_bgr.shape[:2]
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+        # Pre-resize to SegFormer's native resolution with OpenCV (faster than PIL resize)
+        _SEGFORMER_INPUT_SIZE = 512
+        if orig_h > _SEGFORMER_INPUT_SIZE or orig_w > _SEGFORMER_INPUT_SIZE:
+            scale = _SEGFORMER_INPUT_SIZE / max(orig_h, orig_w)
+            small = cv2.resize(
+                frame_bgr,
+                (int(orig_w * scale), int(orig_h * scale)),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        else:
+            small = frame_bgr
+
+        frame_rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         pil_image = _PIL_Image.fromarray(frame_rgb)
 
-        inputs = self._processor(images=pil_image, return_tensors="pt").to(self._device)
+        inputs = self._processor(images=pil_image, return_tensors="pt")
+        # Cast pixel_values to FP16 when model is in half precision
+        if getattr(self, "_fp16", False):
+            inputs = {
+                k: v.to(self._device, dtype=torch.float16) if v.is_floating_point() else v.to(self._device)
+                for k, v in inputs.items()
+            }
+        else:
+            inputs = {k: v.to(self._device) for k, v in inputs.items()}
 
         with _torch_no_grad():
             outputs = self._model(**inputs)
 
-        # Upsample logits to original frame resolution
-        logits = outputs.logits   # (1, C, H/4, W/4)
+        # Upsample logits back to original frame resolution
+        logits = outputs.logits.float()   # (1, C, H/4, W/4) — back to fp32 for interpolate
         upsampled = F.interpolate(
             logits,
             size=(orig_h, orig_w),
@@ -1071,14 +1094,12 @@ class SemanticSegmentationEngine:
             upsampled.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
         )
 
-        # Build BGR colour map
-        palette = self.CITYSCAPES_BGR
-        colormap = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
-        for cid in range(len(palette)):
-            colormap[label_map == cid] = palette[cid]
-
-        if TORCH_AVAILABLE and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Vectorized BGR colormap via numpy LUT — much faster than a Python loop
+        palette  = self.CITYSCAPES_BGR
+        lut      = np.zeros((256, 3), dtype=np.uint8)
+        for i, c in enumerate(palette):
+            lut[i] = c
+        colormap = lut[label_map]   # shape (H, W, 3)
 
         return SemanticResult(
             label_map=label_map,
