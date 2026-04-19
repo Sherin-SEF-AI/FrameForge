@@ -1684,11 +1684,12 @@ class MainWindow(QMainWindow):
         self._output_dir:         str                     = ""
         self._is_playing:         bool                    = False
 
-        # Render caches — avoid redundant CPU work on identical frames
+        # Render cache — skip draw_overlay when frame+result+filter unchanged.
+        # Uses _result_version (a plain counter) NOT id() — Python reuses
+        # memory addresses after GC which causes stale cache bugs.
+        self._result_version:     int                     = 0
         self._overlay_cache_key:  "tuple | None"          = None
         self._overlay_cache_img:  "np.ndarray | None"     = None
-        self._show_bgr_cache_id:  "int | None"            = None
-        self._show_bgr_cache_rgb: "np.ndarray | None"     = None
         self._last_infer_time:    float                   = 0.0
         self._last_frame_time:    float                   = 0.0
         self._fps_window:         deque                   = deque(maxlen=10)
@@ -2582,6 +2583,7 @@ class MainWindow(QMainWindow):
         self._slider.setMaximum(max(0, total - 1))
         self._slider.setValue(0)
         self._current_frame_idx  = 0
+        self._result_version    += 1
         self._current_result     = None
         self._selected_detection = -1
         self._frame_store.clear()
@@ -2672,6 +2674,7 @@ class MainWindow(QMainWindow):
         Handle InferenceWorker.finished: store result, update known classes,
         clear selection, refresh the display, and persist to frame store.
         """
+        self._result_version    += 1
         self._current_result     = result
         self._selected_detection = -1
         self._frame_viewer.set_selection(None)
@@ -2821,6 +2824,7 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
+            self._result_version    += 1
             self._current_result     = None
             self._selected_detection = -1
             self._frame_viewer.set_selection(None)
@@ -2864,6 +2868,7 @@ class MainWindow(QMainWindow):
             return
         if self._current_result is None:
             h, w = self._current_frame_bgr.shape[:2]
+            self._result_version    += 1
             self._current_result = InferenceResult([], [], [], [], [], (h, w))
         dlg = AddDetectionDialog(list(self._known_classes.values()), self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -2900,6 +2905,7 @@ class MainWindow(QMainWindow):
             return
         if self._current_result is None:
             h, w = self._current_frame_bgr.shape[:2]
+            self._result_version    += 1
             self._current_result = InferenceResult([], [], [], [], [], (h, w))
         dlg = AddDetectionDialog(list(self._known_classes.values()), self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -3182,6 +3188,7 @@ class MainWindow(QMainWindow):
     def _on_sam_refine_done(self, result: InferenceResult):
         self._btn_auto_segment.setEnabled(True)
         n = len(result.masks_binary)
+        self._result_version += 1
         self._current_result = result
         self._frame_store[self._current_frame_idx] = result
         self._lbl_refiner_status.setText(f"Done — {n} mask(s) refined")
@@ -3457,6 +3464,7 @@ class MainWindow(QMainWindow):
         self._frame_store[frame_idx] = result
         # If this is the currently displayed frame refresh it live
         if frame_idx == self._current_frame_idx:
+            self._result_version += 1
             self._current_result = self._deep_copy_result(result)
             self._refresh_display()
 
@@ -3553,6 +3561,7 @@ class MainWindow(QMainWindow):
 
     def _on_gsam_done(self, result: InferenceResult):
         """Handle GSAMInferenceWorker.finished — store as current result."""
+        self._result_version    += 1
         self._current_result     = result
         self._selected_detection = -1
         self._frame_viewer.set_selection(None)
@@ -3843,6 +3852,7 @@ class MainWindow(QMainWindow):
         self._lbl_sel_info.setText("Nothing selected")
         # Restore annotations from frame store if available
         stored = self._frame_store.get(idx)
+        self._result_version  += 1
         self._current_result   = self._deep_copy_result(stored) if stored else None
         # Restore semantic result from store if available, else clear
         self._current_semantic = self._semantic_store.get(idx, None)
@@ -3886,10 +3896,10 @@ class MainWindow(QMainWindow):
         # ── Instance view (default) ──────────────────────────────────────
         if (self._current_result is not None
                 and self._chk_show_overlay.isChecked()):
-            # Cache the overlay: only recompute when frame/result/filter changes
+            # Safe cache key — frame index + version counter, never id()
             cache_key = (
-                id(self._current_frame_bgr),
-                id(self._current_result),
+                self._current_frame_idx,
+                self._result_version,
                 frozenset(self._enabled_classes) if self._enabled_classes is not None else None,
             )
             if cache_key != self._overlay_cache_key:
@@ -3913,13 +3923,9 @@ class MainWindow(QMainWindow):
                 )
 
     def _show_bgr(self, frame_bgr: np.ndarray):
-        """Convert BGR numpy frame to QPixmap and display it (cached RGB)."""
-        h, w    = frame_bgr.shape[:2]
-        frame_id = id(frame_bgr)
-        if frame_id != self._show_bgr_cache_id:
-            self._show_bgr_cache_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            self._show_bgr_cache_id  = frame_id
-        rgb  = self._show_bgr_cache_rgb
+        """Convert BGR numpy frame to QPixmap and display it."""
+        h, w = frame_bgr.shape[:2]
+        rgb  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888)
         self._frame_viewer.set_frame_pixmap(QPixmap.fromImage(qimg))
 
@@ -3990,6 +3996,7 @@ class MainWindow(QMainWindow):
         redo = self._redo_stacks.setdefault(fid, [])
         redo.append(self._deep_copy_result(self._current_result))
         # Pop and restore
+        self._result_version    += 1
         self._current_result     = stack.pop()
         self._selected_detection = -1
         self._frame_viewer.set_selection(None)
@@ -4006,6 +4013,7 @@ class MainWindow(QMainWindow):
             return
         undo = self._undo_stacks.setdefault(fid, [])
         undo.append(self._deep_copy_result(self._current_result))
+        self._result_version    += 1
         self._current_result     = stack.pop()
         self._selected_detection = -1
         self._frame_viewer.set_selection(None)
@@ -4114,6 +4122,7 @@ class MainWindow(QMainWindow):
             # Re-display current frame if it now has stored annotations
             stored = self._frame_store.get(self._current_frame_idx)
             if stored and self._current_frame_bgr is not None:
+                self._result_version += 1
                 self._current_result = self._deep_copy_result(stored)
                 self._refresh_display()
             n = len(self._frame_store)
