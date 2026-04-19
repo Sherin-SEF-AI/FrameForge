@@ -72,6 +72,8 @@ Run YOLO first for speed, then click "Auto-Segment Boxes" to feed every detected
 **SegFormer Semantic Segmentation**
 Full scene pixel-level classification using HuggingFace SegFormer. Every pixel in the frame gets a class label. Supports Cityscapes and ADE20K variants. Run on the current frame or queue the entire video for batch processing — results stream in frame by frame without accumulating in memory.
 
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/ef2287c0-bc7b-4e31-9310-d35e6f1576fd" />
+
 **Batch Semantic Segmentation**
 "Run All Frames" processes the entire video in the background. GPU cache is flushed between frames to prevent VRAM OOM. A live progress counter shows frames processed. Cancel at any time.
 
