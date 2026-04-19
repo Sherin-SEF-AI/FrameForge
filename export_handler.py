@@ -153,7 +153,7 @@ class ExportHandler:
         """
         self._require_output_dir()
         lines = [
-            f"path: {self._output_dir.resolve()}",
+            "path: .",   # relative — portable across machines and directories
             "train: images",
             "val: images",
             f"nc: {len(class_names)}",

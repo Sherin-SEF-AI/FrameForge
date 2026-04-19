@@ -130,7 +130,7 @@ class InferenceWorker(QThread):
         Exception description on failure.
     """
 
-    finished = pyqtSignal(object, object)
+    finished = pyqtSignal(object)   # InferenceResult only
     error    = pyqtSignal(str)
 
     def __init__(
@@ -161,11 +161,10 @@ class InferenceWorker(QThread):
     def run(self):
         """Run inference and emit ``finished`` or ``error``."""
         try:
-            result    = self._engine.infer(
+            result = self._engine.infer(
                 self._frame, self._conf, self._iou, self._imgsz
             )
-            annotated = self._engine.draw_overlay(self._frame, result)
-            self.finished.emit(result, annotated)
+            self.finished.emit(result)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -190,53 +189,58 @@ class ExportAllWorker(QThread):
     def __init__(
         self,
         export_handler: ExportHandler,
-        video_handler: VideoHandler,
+        video_path: str,
+        total_frames: int,
         inference_engine: InferenceEngine,
         conf: float,
         iou: float,
         stride: int = 1,
         enabled_classes: "set[int] | None" = None,
     ):
-        """
-        Parameters
-        ----------
-        export_handler : ExportHandler
-            Configured export handler.
-        video_handler : VideoHandler
-            Open video source.
-        inference_engine : InferenceEngine
-            Loaded inference engine.
-        conf : float
-            Confidence threshold.
-        iou : float
-            IoU threshold.
-        stride : int
-            Process every *stride*-th frame.
-        enabled_classes : set[int] or None
-            Class ID filter applied before saving.
-        """
         super().__init__()
-        self._export   = export_handler
-        self._video    = video_handler
-        self._engine   = inference_engine
-        self._conf     = conf
-        self._iou      = iou
-        self._stride   = stride
-        self._classes  = enabled_classes
+        self._export        = export_handler
+        self._video_path    = video_path
+        self._total_frames  = total_frames
+        self._engine        = inference_engine
+        self._conf          = conf
+        self._iou           = iou
+        self._stride        = stride
+        self._classes       = enabled_classes
+        self._cancelled     = False
+
+    def cancel(self):
+        self._cancelled = True
 
     def run(self):
-        """Export frames and emit progress / finished / error signals."""
+        """Open a private VideoCapture (thread-safe) and export frames."""
+        cap = None
         try:
-            self._export.export_all_frames(
-                self._video, self._engine,
-                self._conf, self._iou,
-                progress_callback=lambda c, t: self.progress.emit(c, t),
-                stride=self._stride,
-                enabled_classes=self._classes,
-            )
+            cap = cv2.VideoCapture(self._video_path)
+            if not cap.isOpened():
+                self.error.emit(f"Cannot open video: {self._video_path}")
+                return
+            frames_to_export = list(range(0, self._total_frames, max(1, self._stride)))
+            n = len(frames_to_export)
+            for pos, idx in enumerate(frames_to_export):
+                if self._cancelled:
+                    break
+                cap.set(cv2.CAP_PROP_POS_FRAMES, float(idx))
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    try:
+                        result = self._engine.infer(frame, conf=self._conf, iou=self._iou)
+                        if self._classes is not None:
+                            result = ExportHandler.filter_result(result, self._classes)
+                        self._export.save_yolo(frame, result, idx)
+                    except Exception as exc:
+                        logger.warning("Export failed at frame %d: %s", idx, exc)
+                self.progress.emit(pos + 1, n)
             self.finished.emit("All frames exported successfully.")
         except Exception as exc:
             self.error.emit(str(exc))
+        finally:
+            if cap is not None:
+                cap.release()
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -260,7 +264,7 @@ class GSAMModelLoader(QThread):
 
 class GSAMInferenceWorker(QThread):
     """Background inference worker for GroundedSAMEngine."""
-    finished = pyqtSignal(object, object)   # (InferenceResult, annotated_bgr)
+    finished = pyqtSignal(object)   # InferenceResult only
     error    = pyqtSignal(str)
 
     def __init__(
@@ -280,11 +284,10 @@ class GSAMInferenceWorker(QThread):
 
     def run(self):
         try:
-            result    = self._engine.infer(
+            result = self._engine.infer(
                 self._frame, self._prompt, self._box_thr, self._text_thr
             )
-            annotated = self._engine.draw_overlay(self._frame, result)
-            self.finished.emit(result, annotated)
+            self.finished.emit(result)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -325,47 +328,67 @@ class SemanticBatchWorker(QThread):
     """
     Runs semantic segmentation on every frame in the video sequentially.
 
-    Results are emitted per-frame via frame_done and collected by the main
-    thread — the worker never accumulates them, avoiding OOM on long videos.
-    finished emits only the count of frames that were processed.
+    Opens its own private cv2.VideoCapture from the video path so it never
+    shares the main thread's capture object — cv2.VideoCapture is not
+    thread-safe and sharing it causes a segfault.
+
+    Results are emitted per-frame via frame_done; the worker never accumulates
+    them, avoiding OOM on long videos. finished emits only the frame count.
     """
     progress   = pyqtSignal(int, int)    # (done, total)
     frame_done = pyqtSignal(int, object) # (frame_idx, SemanticResult)
     finished   = pyqtSignal(int)         # total frames processed
     error      = pyqtSignal(str)
 
-    def __init__(self, engine: SemanticSegmentationEngine, video_handler, stride: int = 1):
+    def __init__(self, engine: SemanticSegmentationEngine,
+                 video_path: str, total_frames: int, stride: int = 1,
+                 already_cached: "set[int] | None" = None):
         super().__init__()
-        self._engine  = engine
-        self._video   = video_handler
-        self._stride  = max(1, stride)
-        self._cancel  = False
+        self._engine          = engine
+        self._video_path      = video_path
+        self._total_frames    = total_frames
+        self._stride          = max(1, stride)
+        self._cancel          = False
+        self._already_cached  = already_cached or set()
 
     def cancel(self):
         self._cancel = True
 
     def run(self):
+        import torch as _torch
+        cap = None
         try:
-            import torch as _torch
-            total_frames = self._video.total_frames()
-            indices = list(range(0, total_frames, self._stride))
+            # Own private capture — no sharing with the main thread
+            cap = cv2.VideoCapture(self._video_path)
+            if not cap.isOpened():
+                self.error.emit(f"Cannot open video: {self._video_path}")
+                return
+
+            indices = list(range(0, self._total_frames, self._stride))
             processed = 0
             for done, idx in enumerate(indices, 1):
                 if self._cancel:
                     break
-                frame = self._video.get_frame(idx)
-                if frame is None:
+                if idx in self._already_cached:
+                    self.progress.emit(done, len(indices))
+                    processed += 1
+                    continue
+                cap.set(cv2.CAP_PROP_POS_FRAMES, float(idx))
+                ret, frame = cap.read()
+                if not ret or frame is None:
                     continue
                 result = self._engine.infer(frame)
                 self.frame_done.emit(idx, result)
                 self.progress.emit(done, len(indices))
                 processed += 1
-                # Free GPU cache after every frame to prevent VRAM OOM
                 if _torch.cuda.is_available():
                     _torch.cuda.empty_cache()
             self.finished.emit(processed)
         except Exception as exc:
             self.error.emit(str(exc))
+        finally:
+            if cap is not None:
+                cap.release()
 
 
 class SAMRefineLoadWorker(QThread):
@@ -1577,7 +1600,8 @@ class MainWindow(QMainWindow):
         self.resize(1280, 720)
 
         # Core components
-        self._video  = VideoHandler()
+        self._video           = VideoHandler()
+        self._video_file_path = ""
         self._engine = InferenceEngine()
         self._export = ExportHandler()
 
@@ -2375,12 +2399,24 @@ class MainWindow(QMainWindow):
             return
         if self._is_playing:
             self._on_play_pause()
+        # Fix 3: cancel all running background workers before switching video
+        for worker_attr in (
+            "_infer_worker", "_gsam_infer_worker", "_export_worker",
+            "_sem_batch_worker", "_sam_refine_worker", "_train_worker",
+        ):
+            w = getattr(self, worker_attr, None)
+            if w is not None and w.isRunning():
+                if hasattr(w, "cancel"):
+                    w.cancel()
+                else:
+                    w.quit()
         ok = self._video.open(path)
         if not ok:
             QMessageBox.critical(self, "Error",
                                  f"Could not open video file:\n{path}")
             self._log(f"ERROR: Could not open video — {path}")
             return
+        self._video_file_path = path   # stored for thread-safe batch workers
         total = self._video.total_frames()
         self._slider.setMaximum(max(0, total - 1))
         self._slider.setValue(0)
@@ -2470,7 +2506,7 @@ class MainWindow(QMainWindow):
         self._infer_worker.error.connect(self._on_inference_error)
         self._infer_worker.start()
 
-    def _on_inference_done(self, result: InferenceResult, _annotated):
+    def _on_inference_done(self, result: InferenceResult):
         """
         Handle InferenceWorker.finished: store result, update known classes,
         clear selection, refresh the display, and persist to frame store.
@@ -2827,6 +2863,21 @@ class MainWindow(QMainWindow):
         if not self._output_dir:
             self._log("Set an output directory first.")
             return
+        if not self._video_file_path:
+            self._log("Video path unavailable — re-open the video file.")
+            return
+
+        # Fix 9: warn if existing labels will be overwritten
+        labels_dir = Path(self._output_dir) / "labels"
+        if labels_dir.exists() and any(labels_dir.glob("frame_*.txt")):
+            reply = QMessageBox.question(
+                self, "Overwrite Labels?",
+                f"Existing label files in:\n{labels_dir}\n\n"
+                "Export All will overwrite them. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
 
         stride       = self._spin_stride.value()
         n_export     = len(range(0, self._video.total_frames(), stride))
@@ -2839,14 +2890,19 @@ class MainWindow(QMainWindow):
         self._progress_dlg.show()
 
         self._export_worker = ExportAllWorker(
-            self._export, self._video, self._engine,
-            self._spin_conf.value(), self._spin_iou.value(),
-            stride=stride, enabled_classes=self._enabled_classes,
+            self._export,
+            self._video_file_path,
+            self._video.total_frames(),
+            self._engine,
+            self._spin_conf.value(),
+            self._spin_iou.value(),
+            stride=stride,
+            enabled_classes=self._enabled_classes,
         )
         self._export_worker.progress.connect(self._on_export_progress)
         self._export_worker.finished.connect(self._on_export_finished)
         self._export_worker.error.connect(self._on_export_error)
-        self._progress_dlg.canceled.connect(self._export_worker.terminate)
+        self._progress_dlg.canceled.connect(self._export_worker.cancel)
         self._export_worker.start()
         self._log(f"Export started — stride={stride}, "
                   f"{n_export} frames to process …")
@@ -3011,6 +3067,18 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Fix 10: pre-flight check — require at least one non-empty label file
+        label_files = list(Path(labels_dir).glob("*.txt"))
+        non_empty   = [f for f in label_files if f.stat().st_size > 0]
+        if not non_empty:
+            QMessageBox.warning(
+                self, "No Labels Found",
+                f"No non-empty label files found in:\n{labels_dir}\n\n"
+                "Run inference and export at least a few frames before training."
+            )
+            self._log("Training aborted — no label files found in dataset.")
+            return
+
         # Generate data.yaml
         try:
             from taxonomy import CLASS_NAMES as _CN
@@ -3114,6 +3182,8 @@ class MainWindow(QMainWindow):
         if self._gsam_infer_worker and self._gsam_infer_worker.isRunning():
             return
         self._btn_run_gsam.setEnabled(False)
+        self._lbl_gsam_status.setText("Running inference…")
+        self._lbl_gsam_status.setStyleSheet("color:#DDAA00;font-size:8pt;")
         prompt = self._edit_gsam_prompt.text().strip() or GROUNDED_SAM_PROMPT
         self._gsam_infer_worker = GSAMInferenceWorker(
             self._gsam_engine,
@@ -3127,18 +3197,21 @@ class MainWindow(QMainWindow):
         self._gsam_infer_worker.start()
         self._log(f"Grounded SAM inference running…")
 
-    def _on_gsam_done(self, result: InferenceResult, _annotated):
+    def _on_gsam_done(self, result: InferenceResult):
         """Handle GSAMInferenceWorker.finished — store as current result."""
         self._current_result     = result
         self._selected_detection = -1
         self._frame_viewer.set_selection(None)
         self._lbl_sel_info.setText("Nothing selected")
         self._btn_run_gsam.setEnabled(True)
+        self._lbl_gsam_status.setText(self._gsam_engine.status())
+        self._lbl_gsam_status.setStyleSheet("color:#44CC44;font-size:8pt;")
         for cid, cname in zip(result.class_ids, result.class_names):
             self._known_classes[cid] = cname
         self._frame_store[self._current_frame_idx] = self._deep_copy_result(result)
         self._undo_stacks.pop(self._current_frame_idx, None)
         self._redo_stacks.pop(self._current_frame_idx, None)
+        self._update_auto_segment_btn()
         self._refresh_display()
         self._log(
             f"Grounded SAM: {len(result.class_ids)} detection(s) "
@@ -3147,6 +3220,8 @@ class MainWindow(QMainWindow):
 
     def _on_gsam_error(self, msg: str):
         self._btn_run_gsam.setEnabled(True)
+        self._lbl_gsam_status.setText(f"Error: {msg[:60]}")
+        self._lbl_gsam_status.setStyleSheet("color:#CC4444;font-size:8pt;")
         self._log(f"ERROR during Grounded SAM inference: {msg}")
 
     # ══════════════════════════════════════════════════════════════════ #
@@ -3155,6 +3230,10 @@ class MainWindow(QMainWindow):
 
     def _on_load_semantic(self):
         """Load SegFormer model in background."""
+        model_id = self._combo_sem_model.currentText()
+        if self._sem_engine.is_loaded() and model_id in self._sem_engine.status():
+            self._log(f"Semantic model already loaded: {self._sem_engine.status()}")
+            return
         self._btn_load_sem.setEnabled(False)
         self._lbl_sem_status.setText("Downloading/loading model…")
         self._lbl_sem_status.setStyleSheet("color:#DDAA00;font-size:8pt;")
@@ -3222,7 +3301,7 @@ class MainWindow(QMainWindow):
         if not self._sem_engine.is_loaded():
             self._log("Load semantic model first.")
             return
-        if self._video is None:
+        if not self._video_file_path:
             self._log("Open a video first.")
             return
         if self._sem_batch_worker and self._sem_batch_worker.isRunning():
@@ -3230,10 +3309,19 @@ class MainWindow(QMainWindow):
             self._sem_batch_worker.cancel()
             self._btn_run_sem_all.setText("Run All Frames")
             self._lbl_sem_batch_progress.setText("Cancelled.")
+            if hasattr(self, "_spin_stride"):
+                self._spin_stride.setEnabled(True)
             return
         stride = self._spin_stride.value() if hasattr(self, "_spin_stride") else 1
+        # Fix 14: lock stride spinbox while batch is running
+        if hasattr(self, "_spin_stride"):
+            self._spin_stride.setEnabled(False)
         self._sem_batch_worker = SemanticBatchWorker(
-            self._sem_engine, self._video, stride
+            self._sem_engine,
+            self._video_file_path,
+            self._video.total_frames(),
+            stride,
+            already_cached=set(self._semantic_store.keys()),
         )
         self._sem_batch_worker.progress.connect(self._on_sem_batch_progress)
         self._sem_batch_worker.frame_done.connect(self._on_sem_batch_frame_done)
@@ -3262,6 +3350,8 @@ class MainWindow(QMainWindow):
     def _on_sem_batch_finished(self, n: int):
         self._btn_run_sem_all.setText("Run All Frames")
         self._lbl_sem_batch_progress.setText(f"Done — {n} frames processed.")
+        if hasattr(self, "_spin_stride"):
+            self._spin_stride.setEnabled(True)
         self._log(f"Batch semantic complete: {n} frames cached.")
         # Refresh display in case current frame result just arrived
         if self._current_frame_idx in self._semantic_store:
@@ -3272,6 +3362,8 @@ class MainWindow(QMainWindow):
     def _on_sem_batch_error(self, msg: str):
         self._btn_run_sem_all.setText("Run All Frames")
         self._lbl_sem_batch_progress.setText(f"Error: {msg}")
+        if hasattr(self, "_spin_stride"):
+            self._spin_stride.setEnabled(True)
         self._log(f"ERROR batch semantic: {msg}")
 
     def _on_save_semantic(self):
@@ -3401,6 +3493,7 @@ class MainWindow(QMainWindow):
         self._current_semantic = self._semantic_store.get(idx, None)
         self._btn_save_semantic.setEnabled(self._current_semantic is not None)
         self._frame_viewer.reset_zoom()
+        self._update_auto_segment_btn()
         self._refresh_display()
 
         total = self._video.total_frames()
@@ -3466,6 +3559,10 @@ class MainWindow(QMainWindow):
         """QTimer slot: advance one frame during playback."""
         total = self._video.total_frames()
         if total == 0:
+            return
+        # Fix 2: skip advance tick if inference is already running to avoid race
+        if (self._infer_worker is not None and self._infer_worker.isRunning()) or \
+           (self._gsam_infer_worker is not None and self._gsam_infer_worker.isRunning()):
             return
         next_idx = self._current_frame_idx + 1
         if next_idx >= total:
@@ -3632,6 +3729,17 @@ class MainWindow(QMainWindow):
                     class_names = entry["class_names"],
                     orig_shape  = tuple(entry["orig_shape"]),
                 )
+            # Fix 4: warn if session resolution doesn't match current video
+            if self._current_frame_bgr is not None and self._frame_store:
+                vid_h, vid_w = self._current_frame_bgr.shape[:2]
+                first_result = next(iter(self._frame_store.values()))
+                sess_h, sess_w = first_result.orig_shape
+                if (sess_h, sess_w) != (vid_h, vid_w):
+                    QMessageBox.warning(
+                        self, "Resolution Mismatch",
+                        f"Session was created at {sess_w}×{sess_h} but the current video "
+                        f"is {vid_w}×{vid_h}.\n\nAnnotation masks may not align correctly."
+                    )
             # Re-display current frame if it now has stored annotations
             stored = self._frame_store.get(self._current_frame_idx)
             if stored and self._current_frame_bgr is not None:
@@ -3645,6 +3753,16 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════════════ #
     #  Helpers                                                            #
     # ══════════════════════════════════════════════════════════════════ #
+
+    def _update_auto_segment_btn(self):
+        """Fix 11: enable Auto-Segment only when refiner loaded AND boxes exist."""
+        has_boxes = (
+            self._current_result is not None
+            and len(self._current_result.boxes_xyxy) > 0
+        )
+        self._btn_auto_segment.setEnabled(
+            self._sam_refiner.is_loaded() and has_boxes
+        )
 
     def _get_display_indices(self) -> list[int]:
         """

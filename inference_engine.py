@@ -546,6 +546,8 @@ class GroundedSAMEngine:
         self._device         = "cpu"
         self._loaded         = False
         self._status         = "Not loaded"
+        # Cache: avoid re-encoding the same frame in SAM when thresholds change
+        self._sam_frame_fingerprint: tuple | None = None
 
     # ── Class-level queries ──────────────────────────────────────────────
 
@@ -688,7 +690,15 @@ class GroundedSAMEngine:
         class_names:  list[str]         = []
 
         if self._sam_predictor is not None and len(boxes_np) > 0:
-            self._sam_predictor.set_image(frame_rgb)
+            # Only re-encode if the frame has changed (fingerprint: shape + 2 pixel samples)
+            mid_r = orig_h // 2
+            mid_c = orig_w // 2
+            fp = (frame_rgb.shape,
+                  int(frame_rgb[0, 0, 0]),
+                  int(frame_rgb[mid_r, mid_c, 0]))
+            if fp != self._sam_frame_fingerprint:
+                self._sam_predictor.set_image(frame_rgb)
+                self._sam_frame_fingerprint = fp
 
         for box, score, raw_label in zip(boxes_np, scores_np, raw_labels):
             x1, y1, x2, y2 = box.tolist()
