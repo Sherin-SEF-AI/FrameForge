@@ -5,3 +5,10 @@ torch>=2.2.0
 torchvision>=0.17.0
 numpy>=1.26.0
 Pillow>=10.2.0
+
+# Grounded SAM (optional — text-prompted segmentation)
+# pip install transformers>=4.38 timm
+# pip install segment-anything          # for mask prediction
+
+# Semantic segmentation (optional — SegFormer)
+# pip install transformers>=4.38        # same package as above

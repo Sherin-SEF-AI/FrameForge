@@ -10,8 +10,10 @@ implemented: CUDNN benchmark mode, warm-up pass, empty-cache after every
 call, and an automatic CPU fallback on OutOfMemoryError.
 """
 
+import contextlib
 import dataclasses
 import logging
+import os
 import warnings
 
 import cv2
@@ -184,6 +186,7 @@ class InferenceEngine:
         frame_bgr: np.ndarray,
         conf: float = 0.35,
         iou: float = 0.45,
+        imgsz: int = 640,
     ) -> "InferenceResult":
         """
         Run segmentation inference on a single BGR frame.
@@ -215,7 +218,7 @@ class InferenceEngine:
 
         # Optimisation 6: OOM guard with automatic CPU fallback
         try:
-            return self._run_inference(frame_bgr, conf, iou)
+            return self._run_inference(frame_bgr, conf, iou, imgsz)
         except Exception as exc:
             is_oom = (
                 TORCH_AVAILABLE
@@ -230,7 +233,7 @@ class InferenceEngine:
                     self.model = self.model.to("cpu")
                     self.model.model.float()
                     self._device = "cpu"
-                    return self._run_inference(frame_bgr, conf, iou)
+                    return self._run_inference(frame_bgr, conf, iou, imgsz)
                 except Exception as retry_exc:
                     raise RuntimeError(
                         f"Inference failed on CPU after OOM fallback: {retry_exc}"
@@ -244,6 +247,7 @@ class InferenceEngine:
         frame_bgr: np.ndarray,
         conf: float,
         iou: float,
+        imgsz: int = 640,
     ) -> "InferenceResult":
         """
         Internal helper: call the Ultralytics model and unpack the result.
@@ -263,12 +267,11 @@ class InferenceEngine:
             Populated inference result.
         """
         use_half = self._device == "cuda"
-        # Optimisation 2: fixed imgsz=640 — never process at full GoPro res
         results = self.model(
             frame_bgr,
             conf=conf,
             iou=iou,
-            imgsz=640,
+            imgsz=imgsz,
             half=use_half,
             verbose=False,
         )
@@ -423,3 +426,647 @@ class InferenceEngine:
     def model_name(self) -> str:
         """Return the filename of the currently loaded model weights."""
         return self._model_name
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+#  SemanticResult dataclass                                                    #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+@dataclasses.dataclass
+class SemanticResult:
+    """
+    Pixel-level semantic segmentation output.
+
+    Attributes
+    ----------
+    label_map : np.ndarray
+        H × W uint8 array of class IDs (0-based).
+    colormap : np.ndarray
+        H × W × 3 BGR array — colourised visualisation of *label_map*.
+    class_names : list[str]
+        Human-readable name for each label ID.
+    orig_shape : tuple[int, int]
+        ``(height, width)`` of the source frame.
+    """
+
+    label_map:   np.ndarray
+    colormap:    np.ndarray
+    class_names: list[str]
+    orig_shape:  tuple[int, int]
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+#  Optional-dependency guards                                                  #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+_GROUNDING_DINO_AVAILABLE = False
+try:
+    from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+    import PIL.Image as _PIL_Image
+    _GROUNDING_DINO_AVAILABLE = True
+except ImportError:
+    pass
+
+_SAM_AVAILABLE = False
+try:
+    from segment_anything import SamPredictor, sam_model_registry
+    _SAM_AVAILABLE = True
+except ImportError:
+    pass
+
+_MOBILE_SAM_AVAILABLE = False
+try:
+    from mobile_sam import build_sam_vit_t
+    from mobile_sam import SamPredictor as _MobileSamPredictor
+    _MOBILE_SAM_AVAILABLE = True
+except ImportError:
+    pass
+
+_SEGFORMER_AVAILABLE = False
+try:
+    from transformers import (
+        AutoImageProcessor,
+        SegformerForSemanticSegmentation,
+    )
+    _SEGFORMER_AVAILABLE = True
+except ImportError:
+    pass
+
+
+def _torch_no_grad():
+    """Return a no-grad context manager, or a null one if torch is absent."""
+    if TORCH_AVAILABLE:
+        return torch.no_grad()
+    return contextlib.nullcontext()
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+#  GroundedSAMEngine                                                           #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+class GroundedSAMEngine:
+    """
+    Zero-shot text-prompted instance segmentation.
+
+    Grounding DINO converts a comma/period-separated text prompt into
+    bounding boxes.  SAM then generates precise binary masks for each box.
+
+    Both components are optional:
+    - Without SAM: returns boxes and class labels but no masks.
+    - Without transformers: the engine reports itself as unavailable.
+
+    Dependencies
+    ------------
+    ``pip install transformers>=4.38 timm pillow``
+    ``pip install segment-anything``   # optional, for masks
+    """
+
+    DINO_MODEL_ID = "IDEA-Research/grounding-dino-base"
+
+    # SAM checkpoint filenames and download URLs
+    SAM_CHECKPOINTS: dict[str, tuple[str, str]] = {
+        "vit_b": (
+            "sam_vit_b_01ec64.pth",
+            "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
+        ),
+        "vit_l": (
+            "sam_vit_l_0b3195.pth",
+            "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth",
+        ),
+        "vit_h": (
+            "sam_vit_h_4b8939.pth",
+            "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
+        ),
+    }
+
+    def __init__(self):
+        self._dino_processor = None
+        self._dino_model     = None
+        self._sam_predictor  = None
+        self._device         = "cpu"
+        self._loaded         = False
+        self._status         = "Not loaded"
+
+    # ── Class-level queries ──────────────────────────────────────────────
+
+    @staticmethod
+    def dino_available() -> bool:
+        """Return True when Grounding DINO dependencies are installed."""
+        return _GROUNDING_DINO_AVAILABLE
+
+    @staticmethod
+    def sam_available() -> bool:
+        """Return True when segment-anything is installed."""
+        return _SAM_AVAILABLE
+
+    # ── Loading ──────────────────────────────────────────────────────────
+
+    def load(
+        self,
+        sam_checkpoint: str = "",
+        sam_variant:    str = "vit_b",
+    ) -> tuple[bool, str]:
+        """
+        Load Grounding DINO and (optionally) a SAM predictor.
+
+        Parameters
+        ----------
+        sam_checkpoint : str
+            Path to a SAM ``.pth`` checkpoint.  Empty string skips SAM.
+        sam_variant : str
+            SAM model variant: ``"vit_b"`` / ``"vit_l"`` / ``"vit_h"``.
+
+        Returns
+        -------
+        (success, message) : tuple[bool, str]
+        """
+        if not _GROUNDING_DINO_AVAILABLE:
+            msg = (
+                "Grounding DINO not installed.\n"
+                "Run: pip install transformers>=4.38 timm pillow"
+            )
+            self._status = msg
+            return False, msg
+
+        try:
+            dev = "cuda" if (TORCH_AVAILABLE and torch.cuda.is_available()) else "cpu"
+            self._device = dev
+
+            logger.info("Loading Grounding DINO (%s) on %s …", self.DINO_MODEL_ID, dev)
+            self._dino_processor = AutoProcessor.from_pretrained(self.DINO_MODEL_ID)
+            self._dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
+                self.DINO_MODEL_ID
+            ).to(dev)
+            self._dino_model.eval()
+
+            # SAM (optional)
+            if sam_checkpoint and _SAM_AVAILABLE:
+                logger.info("Loading SAM %s from %s …", sam_variant, sam_checkpoint)
+                sam = sam_model_registry[sam_variant](checkpoint=sam_checkpoint)
+                sam.to(dev)
+                self._sam_predictor = SamPredictor(sam)
+            else:
+                self._sam_predictor = None
+
+            self._loaded = True
+            sam_note = (
+                f" + SAM-{sam_variant}" if self._sam_predictor else " (boxes only — no SAM)"
+            )
+            self._status = f"Grounded SAM on {dev.upper()}{sam_note}"
+            return True, self._status
+
+        except Exception as exc:
+            self._loaded = False
+            self._status = str(exc)
+            logger.error("GroundedSAMEngine.load failed: %s", exc)
+            return False, str(exc)
+
+    def is_loaded(self) -> bool:
+        return self._loaded
+
+    def status(self) -> str:
+        return self._status
+
+    # ── Inference ────────────────────────────────────────────────────────
+
+    def infer(
+        self,
+        frame_bgr:      np.ndarray,
+        text_prompt:    str,
+        box_threshold:  float = 0.35,
+        text_threshold: float = 0.25,
+    ) -> "InferenceResult":
+        """
+        Run Grounded SAM on *frame_bgr* and return an ``InferenceResult``.
+
+        Parameters
+        ----------
+        frame_bgr : np.ndarray
+            Source frame in BGR format.
+        text_prompt : str
+            Comma- or period-separated class names, e.g.
+            ``"pedestrian, car, pothole"`` or the full taxonomy prompt.
+        box_threshold : float
+            DINO box confidence threshold.
+        text_threshold : float
+            DINO text similarity threshold.
+        """
+        if not self._loaded or self._dino_model is None:
+            raise RuntimeError("GroundedSAMEngine not loaded — call load() first.")
+
+        from taxonomy import id_for
+
+        orig_h, orig_w = frame_bgr.shape[:2]
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        pil_image = _PIL_Image.fromarray(frame_rgb)
+
+        prompt = self._format_prompt(text_prompt)
+
+        inputs = self._dino_processor(
+            images=pil_image, text=prompt, return_tensors="pt"
+        ).to(self._device)
+
+        with _torch_no_grad():
+            outputs = self._dino_model(**inputs)
+
+        detections = self._dino_processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            threshold=box_threshold,
+            text_threshold=text_threshold,
+            target_sizes=[(orig_h, orig_w)],
+        )[0]
+
+        boxes_np   = detections["boxes"].cpu().numpy()    # (N, 4) xyxy
+        scores_np  = detections["scores"].cpu().numpy()   # (N,)
+        raw_labels = detections["labels"]                 # list[str]
+
+        boxes_xyxy:   list[list[float]] = []
+        class_ids:    list[int]         = []
+        confidences:  list[float]       = []
+        masks_binary: list[np.ndarray]  = []
+        class_names:  list[str]         = []
+
+        if self._sam_predictor is not None and len(boxes_np) > 0:
+            self._sam_predictor.set_image(frame_rgb)
+
+        for box, score, raw_label in zip(boxes_np, scores_np, raw_labels):
+            x1, y1, x2, y2 = box.tolist()
+            clean = raw_label.strip().lower()
+            cid   = id_for(clean)
+            if cid < 0:
+                cid = len(class_ids)    # assign a new temporary ID
+
+            boxes_xyxy.append([float(x1), float(y1), float(x2), float(y2)])
+            class_ids.append(cid)
+            confidences.append(float(score))
+            class_names.append(clean)
+
+            # SAM mask for this box
+            if self._sam_predictor is not None:
+                try:
+                    sam_masks, _, _ = self._sam_predictor.predict(
+                        box=np.array([x1, y1, x2, y2]),
+                        multimask_output=False,
+                    )
+                    masks_binary.append((sam_masks[0] * 255).astype(np.uint8))
+                except Exception as exc:
+                    logger.warning("SAM predict failed: %s", exc)
+                    masks_binary.append(np.zeros((orig_h, orig_w), dtype=np.uint8))
+
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return InferenceResult(
+            boxes_xyxy=boxes_xyxy,
+            class_ids=class_ids,
+            confidences=confidences,
+            masks_binary=masks_binary,
+            class_names=class_names,
+            orig_shape=(orig_h, orig_w),
+        )
+
+    def draw_overlay(self, frame_bgr: np.ndarray, result: "InferenceResult") -> np.ndarray:
+        """Render overlay using the standard InferenceEngine palette."""
+        return InferenceEngine().draw_overlay(frame_bgr, result)
+
+    # ── Helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_prompt(prompt: str) -> str:
+        """
+        Normalise a user-supplied prompt to Grounding DINO format.
+
+        Input  : ``"pedestrian, car, pothole"``
+        Output : ``"pedestrian . car . pothole ."``
+        """
+        # Split on commas or periods, strip whitespace, replace underscores
+        parts = [
+            p.strip().replace("_", " ")
+            for p in prompt.replace(",", ".").split(".")
+            if p.strip()
+        ]
+        return " . ".join(parts) + " ."
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+#  SAMBoxRefiner                                                               #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+class SAMBoxRefiner:
+    """
+    Lightweight mask refiner: takes any InferenceResult with bounding boxes
+    and uses SAM or MobileSAM to generate tight pixel-accurate masks.
+
+    Supports two backends
+    ---------------------
+    - Original SAM  (segment_anything): vit_b / vit_l / vit_h
+    - MobileSAM     (mobile_sam):       TinyViT — ~10× faster, similar quality
+
+    Typical workflow
+    ----------------
+    1. Run YOLO to get bounding boxes (fast).
+    2. Call ``refine(frame_bgr, yolo_result)`` to replace rectangular masks
+       with tight SAM masks in one call.
+    """
+
+    MOBILE_SAM_URL  = "https://huggingface.co/dhkim2810/MobileSAM/resolve/main/mobile_sam.pt"
+    MOBILE_SAM_CKPT = "mobile_sam.pt"
+
+    def __init__(self):
+        self._predictor  = None
+        self._device     = "cpu"
+        self._loaded     = False
+        self._is_mobile  = False
+        self._status     = "Not loaded"
+
+    @staticmethod
+    def sam_available() -> bool:
+        """True when segment-anything is installed."""
+        return _SAM_AVAILABLE
+
+    @staticmethod
+    def mobile_sam_available() -> bool:
+        """True when mobile-sam is installed."""
+        return _MOBILE_SAM_AVAILABLE
+
+    def is_loaded(self) -> bool:
+        return self._loaded
+
+    def status(self) -> str:
+        return self._status
+
+    def load(
+        self,
+        checkpoint: str = "",
+        variant:    str = "vit_b",
+        use_mobile: bool = False,
+    ) -> tuple[bool, str]:
+        """
+        Load the SAM or MobileSAM predictor.
+
+        Parameters
+        ----------
+        checkpoint : str
+            Path to a SAM .pth checkpoint.  For MobileSAM, auto-downloaded
+            if left empty.
+        variant : str
+            SAM variant (``'vit_b'``/``'vit_l'``/``'vit_h'``).
+            Ignored when *use_mobile* is True.
+        use_mobile : bool
+            When True, load MobileSAM (TinyViT) instead of original SAM.
+        """
+        dev = "cuda" if (TORCH_AVAILABLE and torch.cuda.is_available()) else "cpu"
+        self._device = dev
+        try:
+            if use_mobile:
+                if not _MOBILE_SAM_AVAILABLE:
+                    return False, "MobileSAM not installed.\nRun: pip install mobile-sam"
+                ckpt = checkpoint or self.MOBILE_SAM_CKPT
+                if not os.path.exists(ckpt):
+                    import urllib.request
+                    logger.info("Downloading MobileSAM checkpoint → %s …", ckpt)
+                    urllib.request.urlretrieve(self.MOBILE_SAM_URL, ckpt)
+                sam = build_sam_vit_t(checkpoint=ckpt)
+                sam.to(dev)
+                self._predictor = _MobileSamPredictor(sam)
+                self._is_mobile = True
+            else:
+                if not _SAM_AVAILABLE:
+                    return False, "SAM not installed.\nRun: pip install segment-anything"
+                if not checkpoint:
+                    return False, "SAM checkpoint path required (e.g. sam_vit_b_01ec64.pth)."
+                if not os.path.exists(checkpoint):
+                    return False, f"Checkpoint not found: {checkpoint}"
+                sam = sam_model_registry[variant](checkpoint=checkpoint)
+                sam.to(dev)
+                self._predictor = SamPredictor(sam)
+                self._is_mobile = False
+
+            self._loaded = True
+            name = "MobileSAM" if self._is_mobile else f"SAM-{variant}"
+            self._status = f"{name} on {dev.upper()}"
+            return True, self._status
+
+        except Exception as exc:
+            self._loaded = False
+            self._status = str(exc)
+            logger.error("SAMBoxRefiner.load failed: %s", exc)
+            return False, str(exc)
+
+    def refine(
+        self,
+        frame_bgr: np.ndarray,
+        result:    "InferenceResult",
+    ) -> "InferenceResult":
+        """
+        Generate a tight SAM mask for every bounding box in *result*.
+
+        Returns a new ``InferenceResult`` with ``masks_binary`` replaced by
+        SAM predictions.  All other fields (boxes, class IDs, confidences,
+        names) are preserved unchanged.
+
+        Falls back to a filled rectangular mask if SAM fails on a specific box.
+        """
+        if not self._loaded or self._predictor is None:
+            raise RuntimeError("SAMBoxRefiner not loaded — call load() first.")
+        if not result.boxes_xyxy:
+            return result
+
+        orig_h, orig_w = frame_bgr.shape[:2]
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        self._predictor.set_image(frame_rgb)
+
+        new_masks: list[np.ndarray] = []
+        for box in result.boxes_xyxy:
+            x1, y1, x2, y2 = [float(v) for v in box]
+            try:
+                masks, _, _ = self._predictor.predict(
+                    box=np.array([x1, y1, x2, y2], dtype=np.float32),
+                    multimask_output=False,
+                )
+                new_masks.append((masks[0] * 255).astype(np.uint8))
+            except Exception as exc:
+                logger.warning("SAM predict failed for box %s: %s", box, exc)
+                fallback = np.zeros((orig_h, orig_w), dtype=np.uint8)
+                fallback[int(y1):int(y2), int(x1):int(x2)] = 255
+                new_masks.append(fallback)
+
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return InferenceResult(
+            boxes_xyxy=list(result.boxes_xyxy),
+            class_ids=list(result.class_ids),
+            confidences=list(result.confidences),
+            masks_binary=new_masks,
+            class_names=list(result.class_names),
+            orig_shape=result.orig_shape,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+#  SemanticSegmentationEngine                                                  #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+class SemanticSegmentationEngine:
+    """
+    Full-scene pixel-level semantic segmentation using SegFormer.
+
+    Default model: ``nvidia/segformer-b2-finetuned-cityscapes-1024-1024``
+    (19 Cityscapes classes, downloaded automatically via HuggingFace Hub on
+    first use).
+
+    Dependencies
+    ------------
+    ``pip install transformers>=4.38 pillow``
+    """
+
+    DEFAULT_MODEL = "nvidia/segformer-b2-finetuned-cityscapes-1024-1024"
+
+    # Cityscapes BGR palette (19 classes)
+    CITYSCAPES_BGR: list[tuple[int, int, int]] = [
+        (128,  64, 128),   # road
+        (232,  35, 244),   # sidewalk
+        ( 70,  70,  70),   # building
+        (156, 102, 102),   # wall
+        (153, 153, 190),   # fence
+        (153, 153, 153),   # pole
+        ( 30, 170, 250),   # traffic light
+        (  0, 220, 220),   # traffic sign
+        ( 35, 142, 107),   # vegetation
+        (152, 251, 152),   # terrain
+        (180, 130,  70),   # sky
+        ( 60,  20, 220),   # person
+        (  0,   0, 255),   # rider
+        (142,   0,   0),   # car
+        ( 70,   0,   0),   # truck
+        (100,  60,   0),   # bus
+        (100,  80,   0),   # train
+        (230,   0,   0),   # motorcycle
+        ( 32,  11, 119),   # bicycle
+    ]
+
+    def __init__(self):
+        self._processor   = None
+        self._model       = None
+        self._loaded      = False
+        self._device      = "cpu"
+        self._class_names: list[str] = []
+        self._status      = "Not loaded"
+
+    @staticmethod
+    def is_available() -> bool:
+        """Return True when SegFormer dependencies are installed."""
+        return _SEGFORMER_AVAILABLE
+
+    # ── Loading ──────────────────────────────────────────────────────────
+
+    def load(self, model_id: str = DEFAULT_MODEL) -> tuple[bool, str]:
+        """
+        Download (if needed) and load the SegFormer model.
+
+        Parameters
+        ----------
+        model_id : str
+            HuggingFace model identifier.
+        """
+        if not _SEGFORMER_AVAILABLE:
+            msg = "SegFormer not installed.\nRun: pip install transformers>=4.38 pillow"
+            self._status = msg
+            return False, msg
+
+        try:
+            dev = "cuda" if (TORCH_AVAILABLE and torch.cuda.is_available()) else "cpu"
+            self._device = dev
+
+            logger.info("Loading SegFormer (%s) on %s …", model_id, dev)
+            self._processor = AutoImageProcessor.from_pretrained(model_id)
+            self._model     = SegformerForSemanticSegmentation.from_pretrained(
+                model_id
+            ).to(dev)
+            self._model.eval()
+
+            # Extract class names from model config
+            cfg = self._model.config
+            if hasattr(cfg, "id2label"):
+                n = len(cfg.id2label)
+                self._class_names = [cfg.id2label[i] for i in range(n)]
+            else:
+                self._class_names = [f"class_{i}" for i in range(256)]
+
+            self._loaded = True
+            self._status = f"SegFormer on {dev.upper()} ({len(self._class_names)} classes)"
+            return True, self._status
+
+        except Exception as exc:
+            self._loaded = False
+            self._status = str(exc)
+            logger.error("SemanticSegmentationEngine.load failed: %s", exc)
+            return False, str(exc)
+
+    def is_loaded(self) -> bool:
+        return self._loaded
+
+    def status(self) -> str:
+        return self._status
+
+    # ── Inference ────────────────────────────────────────────────────────
+
+    def infer(self, frame_bgr: np.ndarray) -> SemanticResult:
+        """
+        Run semantic segmentation on *frame_bgr*.
+
+        Parameters
+        ----------
+        frame_bgr : np.ndarray
+            Source BGR frame (any resolution).
+
+        Returns
+        -------
+        SemanticResult
+            Pixel-level class IDs and a colourised visualisation.
+        """
+        if not self._loaded or self._model is None:
+            raise RuntimeError(
+                "SemanticSegmentationEngine not loaded — call load() first."
+            )
+
+        import torch.nn.functional as F
+
+        orig_h, orig_w = frame_bgr.shape[:2]
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        pil_image = _PIL_Image.fromarray(frame_rgb)
+
+        inputs = self._processor(images=pil_image, return_tensors="pt").to(self._device)
+
+        with _torch_no_grad():
+            outputs = self._model(**inputs)
+
+        # Upsample logits to original frame resolution
+        logits = outputs.logits   # (1, C, H/4, W/4)
+        upsampled = F.interpolate(
+            logits,
+            size=(orig_h, orig_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        label_map = (
+            upsampled.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+        )
+
+        # Build BGR colour map
+        palette = self.CITYSCAPES_BGR
+        colormap = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
+        for cid in range(len(palette)):
+            colormap[label_map == cid] = palette[cid]
+
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return SemanticResult(
+            label_map=label_map,
+            colormap=colormap,
+            class_names=self._class_names,
+            orig_shape=(orig_h, orig_w),
+        )
