@@ -55,7 +55,7 @@ from video_handler import VideoHandler
 from inference_engine import (
     InferenceEngine, InferenceResult,
     GroundedSAMEngine, SemanticSegmentationEngine, SemanticResult,
-    SAMBoxRefiner,
+    SAMBoxRefiner, SAM2PropagationEngine,
 )
 from export_handler import ExportHandler
 from taxonomy import GROUNDED_SAM_PROMPT, CLASS_NAMES as TAXONOMY_CLASS_NAMES
@@ -487,6 +487,78 @@ class TrainingWorker(QThread):
                 self.error.emit(
                     f"Training process exited with code {self._process.returncode}"
                 )
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+# --------------------------------------------------------------------------- #
+
+class PropagationWorker(QThread):
+    """
+    Background thread for SAM 2 temporal mask propagation.
+
+    Extracts frames from the source video into a temp directory, runs the SAM 2
+    video predictor seeded with the keyframe annotations, and emits each
+    propagated frame result as it arrives so the UI stays responsive.
+
+    Signals
+    -------
+    progress   : (int, int)    (done, total) frame count
+    frame_done : (int, object) (global_frame_idx, InferenceResult)
+    finished   : int           total number of frames propagated
+    error      : str           exception message on failure
+    """
+
+    progress   = pyqtSignal(int, int)
+    frame_done = pyqtSignal(int, object)
+    finished   = pyqtSignal(int)
+    error      = pyqtSignal(str)
+
+    def __init__(
+        self,
+        engine:          SAM2PropagationEngine,
+        video_path:      str,
+        keyframe_idx:    int,
+        keyframe_result: InferenceResult,
+        start_idx:       int,
+        end_idx:         int,
+        reverse:         bool = False,
+    ):
+        super().__init__()
+        self._engine          = engine
+        self._video_path      = video_path
+        self._keyframe_idx    = keyframe_idx
+        self._keyframe_result = keyframe_result
+        self._start_idx       = start_idx
+        self._end_idx         = end_idx
+        self._reverse         = reverse
+        self._cancel_flag     = [False]   # mutable flag shared with engine
+
+    def cancel(self):
+        self._cancel_flag[0] = True
+
+    def run(self):
+        done_count = [0]
+        total_frames = self._end_idx - self._start_idx + 1
+
+        def on_progress(done: int, total: int):
+            done_count[0] = done
+            self.progress.emit(done, total)
+
+        try:
+            results = self._engine.propagate(
+                video_path      = self._video_path,
+                keyframe_idx    = self._keyframe_idx,
+                keyframe_result = self._keyframe_result,
+                start_idx       = self._start_idx,
+                end_idx         = self._end_idx,
+                reverse         = self._reverse,
+                progress_cb     = on_progress,
+                cancel_flag     = self._cancel_flag,
+            )
+            for global_idx, result in sorted(results.items()):
+                self.frame_done.emit(global_idx, result)
+            self.finished.emit(len(results))
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -1653,6 +1725,10 @@ class MainWindow(QMainWindow):
         # Training state
         self._train_worker:  TrainingWorker | None = None
 
+        # SAM 2 temporal propagation state
+        self._sam2_engine:       SAM2PropagationEngine       = SAM2PropagationEngine()
+        self._propagation_worker: PropagationWorker | None   = None
+
         # Worker references
         self._model_worker:  ModelLoaderWorker  | None = None
         self._infer_worker:  InferenceWorker    | None = None
@@ -1710,6 +1786,7 @@ class MainWindow(QMainWindow):
         self._build_export_section(left_layout)
         self._build_active_learning_section(left_layout)
         self._build_training_section(left_layout)
+        self._build_propagation_section(left_layout)
         self._build_log_section(left_layout)
         left_layout.addStretch(1)
         left_scroll.setWidget(left_widget)
@@ -2212,6 +2289,83 @@ class MainWindow(QMainWindow):
         ):
             layout.addWidget(btn)
 
+    def _build_propagation_section(self, layout: QVBoxLayout):
+        """Add Temporal Propagation (SAM 2) section."""
+        layout.addWidget(_section_label("Temporal Propagation (SAM 2)"))
+
+        # Checkpoint row
+        ckpt_row = QHBoxLayout()
+        ckpt_row.addWidget(QLabel("Ckpt:"))
+        self._edit_sam2_ckpt = QLineEdit()
+        self._edit_sam2_ckpt.setPlaceholderText("sam2_hiera_tiny.pt")
+        self._edit_sam2_ckpt.setToolTip(
+            "Path to SAM 2 checkpoint (.pt).  Download from:\n"
+            "https://github.com/facebookresearch/segment-anything-2/releases"
+        )
+        ckpt_row.addWidget(self._edit_sam2_ckpt)
+        self._btn_browse_sam2_ckpt = QPushButton("…")
+        self._btn_browse_sam2_ckpt.setFixedWidth(26)
+        ckpt_row.addWidget(self._btn_browse_sam2_ckpt)
+        layout.addLayout(ckpt_row)
+
+        # Variant + load row
+        variant_row = QHBoxLayout()
+        variant_row.addWidget(QLabel("Size:"))
+        self._combo_sam2_variant = QComboBox()
+        for v in ("tiny", "small", "base+", "large"):
+            self._combo_sam2_variant.addItem(v)
+        variant_row.addWidget(self._combo_sam2_variant)
+        self._btn_load_sam2 = QPushButton("Load SAM 2")
+        variant_row.addWidget(self._btn_load_sam2)
+        layout.addLayout(variant_row)
+
+        self._lbl_sam2_status = QLabel("Not loaded")
+        self._lbl_sam2_status.setStyleSheet("color:#888888;font-size:8pt;")
+        layout.addWidget(self._lbl_sam2_status)
+
+        # Propagation range
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("Range:"))
+        self._spin_prop_range = QSpinBox()
+        self._spin_prop_range.setRange(1, 500)
+        self._spin_prop_range.setValue(60)
+        self._spin_prop_range.setToolTip(
+            "Number of frames to propagate from the current frame."
+        )
+        range_row.addWidget(self._spin_prop_range)
+        range_row.addWidget(QLabel("frames"))
+        layout.addLayout(range_row)
+
+        # Propagation direction buttons
+        self._btn_prop_forward  = QPushButton("▶  Propagate Forward")
+        self._btn_prop_backward = QPushButton("◀  Propagate Backward")
+        self._btn_prop_both     = QPushButton("◀▶  Propagate Both")
+        for btn in (self._btn_prop_forward, self._btn_prop_backward, self._btn_prop_both):
+            btn.setEnabled(False)
+            layout.addWidget(btn)
+
+        self._btn_prop_cancel = QPushButton("Cancel Propagation")
+        self._btn_prop_cancel.setEnabled(False)
+        layout.addWidget(self._btn_prop_cancel)
+
+        self._lbl_prop_progress = QLabel("—")
+        self._lbl_prop_progress.setStyleSheet("color:#888888;font-size:8pt;")
+        layout.addWidget(self._lbl_prop_progress)
+
+        # Wire local signals
+        self._btn_browse_sam2_ckpt.clicked.connect(self._on_browse_sam2_ckpt)
+        self._btn_load_sam2.clicked.connect(self._on_load_sam2)
+        self._btn_prop_forward.clicked.connect(
+            lambda: self._on_propagate(direction="forward")
+        )
+        self._btn_prop_backward.clicked.connect(
+            lambda: self._on_propagate(direction="backward")
+        )
+        self._btn_prop_both.clicked.connect(
+            lambda: self._on_propagate(direction="both")
+        )
+        self._btn_prop_cancel.clicked.connect(self._on_propagate_cancel)
+
     def _build_log_section(self, layout: QVBoxLayout):
         """Add Log section."""
         layout.addWidget(_section_label("Log"))
@@ -2403,6 +2557,7 @@ class MainWindow(QMainWindow):
         for worker_attr in (
             "_infer_worker", "_gsam_infer_worker", "_export_worker",
             "_sem_batch_worker", "_sam_refine_worker", "_train_worker",
+            "_propagation_worker",
         ):
             w = getattr(self, worker_attr, None)
             if w is not None and w.isRunning():
@@ -2524,6 +2679,7 @@ class MainWindow(QMainWindow):
         # Clear undo/redo for this frame (new inference replaces corrections)
         self._undo_stacks.pop(self._current_frame_idx, None)
         self._redo_stacks.pop(self._current_frame_idx, None)
+        self._update_propagation_buttons()
         self._refresh_display()
         self._log(
             f"Inference: {len(result.class_ids)} detection(s) "
@@ -3144,6 +3300,198 @@ class MainWindow(QMainWindow):
         self._lbl_train_status.setStyleSheet("color:#CC4444;font-size:8pt;")
         self._log(f"Training ERROR: {msg}")
 
+    # ══════════════════════════════════════════════════════════════════ #
+    #  Slots — Temporal Propagation (SAM 2)                              #
+    # ══════════════════════════════════════════════════════════════════ #
+
+    def _on_browse_sam2_ckpt(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select SAM 2 Checkpoint", "",
+            "SAM 2 Checkpoint (*.pt *.pth);;All Files (*)"
+        )
+        if path:
+            self._edit_sam2_ckpt.setText(path)
+
+    def _on_load_sam2(self):
+        """Load SAM 2 video predictor in a background thread."""
+        checkpoint = self._edit_sam2_ckpt.text().strip()
+        if not checkpoint:
+            QMessageBox.warning(
+                self, "No Checkpoint",
+                "Enter or browse to a SAM 2 checkpoint file (.pt).\n\n"
+                "Download from:\n"
+                "https://github.com/facebookresearch/segment-anything-2/releases"
+            )
+            return
+        variant = self._combo_sam2_variant.currentText()
+        self._btn_load_sam2.setEnabled(False)
+        self._lbl_sam2_status.setText("Loading…")
+        self._lbl_sam2_status.setStyleSheet("color:#DDAA00;font-size:8pt;")
+
+        # Load in a lightweight worker so UI stays responsive
+        class _SAM2LoadWorker(QThread):
+            finished = pyqtSignal(bool, str)
+            def __init__(self, engine, ckpt, variant):
+                super().__init__()
+                self._engine  = engine
+                self._ckpt    = ckpt
+                self._variant = variant
+            def run(self):
+                ok, msg = self._engine.load(self._ckpt, self._variant)
+                self.finished.emit(ok, msg)
+
+        self._sam2_load_worker = _SAM2LoadWorker(self._sam2_engine, checkpoint, variant)
+        self._sam2_load_worker.finished.connect(self._on_sam2_loaded)
+        self._sam2_load_worker.start()
+        self._log(f"Loading SAM 2 ({variant})…")
+
+    def _on_sam2_loaded(self, success: bool, message: str):
+        self._btn_load_sam2.setEnabled(True)
+        if success:
+            self._lbl_sam2_status.setText(message)
+            self._lbl_sam2_status.setStyleSheet("color:#44CC44;font-size:8pt;")
+            self._update_propagation_buttons()
+            self._log(f"SAM 2 ready: {message}")
+        else:
+            self._lbl_sam2_status.setText(f"Error: {message[:60]}")
+            self._lbl_sam2_status.setStyleSheet("color:#CC4444;font-size:8pt;")
+            self._log(f"ERROR loading SAM 2: {message}")
+
+    def _update_propagation_buttons(self):
+        """Enable propagation buttons only when SAM 2 is loaded and frame has annotations."""
+        can_propagate = (
+            self._sam2_engine.is_loaded()
+            and self._current_result is not None
+            and len(self._current_result.class_ids) > 0
+            and bool(self._video_file_path)
+        )
+        for btn in (self._btn_prop_forward, self._btn_prop_backward, self._btn_prop_both):
+            btn.setEnabled(can_propagate)
+
+    def _on_propagate(self, direction: str):
+        """Start SAM 2 propagation in the given direction."""
+        if self._propagation_worker and self._propagation_worker.isRunning():
+            return
+
+        if not self._sam2_engine.is_loaded():
+            self._log("Load SAM 2 first.")
+            return
+        if self._current_result is None or not self._current_result.class_ids:
+            self._log("Run inference on the current frame first (need annotations to propagate).")
+            return
+        if not self._video_file_path:
+            self._log("Open a video first.")
+            return
+
+        total   = self._video.total_frames()
+        cur_idx = self._current_frame_idx
+        rng     = self._spin_prop_range.value()
+
+        if direction == "both":
+            # Run forward first, then backward
+            self._log(f"Propagating both directions — {rng} frames each…")
+            self._start_propagation_run(cur_idx, cur_idx, min(cur_idx + rng, total - 1), reverse=False, chain_backward=True)
+        elif direction == "forward":
+            end_idx = min(cur_idx + rng, total - 1)
+            if end_idx <= cur_idx:
+                self._log("Already at last frame — nothing to propagate forward.")
+                return
+            self._log(f"Propagating forward: frame {cur_idx} → {end_idx}…")
+            self._start_propagation_run(cur_idx, cur_idx, end_idx, reverse=False, chain_backward=False)
+        else:  # backward
+            start_idx = max(cur_idx - rng, 0)
+            if start_idx >= cur_idx:
+                self._log("Already at first frame — nothing to propagate backward.")
+                return
+            self._log(f"Propagating backward: frame {cur_idx} → {start_idx}…")
+            self._start_propagation_run(cur_idx, start_idx, cur_idx, reverse=True, chain_backward=False)
+
+    def _start_propagation_run(
+        self, keyframe_idx: int, start_idx: int, end_idx: int,
+        reverse: bool, chain_backward: bool
+    ):
+        """Spawn a PropagationWorker for one direction."""
+        self._prop_chain_backward    = chain_backward
+        self._prop_keyframe_idx      = keyframe_idx
+        self._prop_keyframe_result   = self._deep_copy_result(self._current_result)
+
+        for btn in (self._btn_prop_forward, self._btn_prop_backward, self._btn_prop_both):
+            btn.setEnabled(False)
+        self._btn_prop_cancel.setEnabled(True)
+        self._lbl_prop_progress.setText("Starting…")
+        self._lbl_prop_progress.setStyleSheet("color:#DDAA00;font-size:8pt;")
+
+        self._propagation_worker = PropagationWorker(
+            engine          = self._sam2_engine,
+            video_path      = self._video_file_path,
+            keyframe_idx    = keyframe_idx,
+            keyframe_result = self._prop_keyframe_result,
+            start_idx       = start_idx,
+            end_idx         = end_idx,
+            reverse         = reverse,
+        )
+        self._propagation_worker.progress.connect(self._on_prop_progress)
+        self._propagation_worker.frame_done.connect(self._on_prop_frame_done)
+        self._propagation_worker.finished.connect(
+            lambda n: self._on_prop_finished(n, chain_backward=chain_backward,
+                                              keyframe_idx=keyframe_idx)
+        )
+        self._propagation_worker.error.connect(self._on_prop_error)
+        self._propagation_worker.start()
+
+    def _on_prop_progress(self, done: int, total: int):
+        pct = int(100 * done / total) if total else 0
+        self._lbl_prop_progress.setText(f"Frame {done}/{total}  ({pct}%)")
+
+    def _on_prop_frame_done(self, frame_idx: int, result: InferenceResult):
+        """Store each propagated frame into the annotation frame_store."""
+        # Never overwrite the keyframe's original human-reviewed annotation
+        if frame_idx == self._current_frame_idx:
+            return
+        self._frame_store[frame_idx] = result
+        # If this is the currently displayed frame refresh it live
+        if frame_idx == self._current_frame_idx:
+            self._current_result = self._deep_copy_result(result)
+            self._refresh_display()
+
+    def _on_prop_finished(self, n: int, chain_backward: bool, keyframe_idx: int):
+        if chain_backward:
+            # First pass (forward) done → now run backward
+            rng       = self._spin_prop_range.value()
+            start_idx = max(keyframe_idx - rng, 0)
+            if start_idx < keyframe_idx:
+                self._lbl_prop_progress.setText(
+                    f"Forward done ({n} frames). Running backward…"
+                )
+                self._log(f"Forward propagation done ({n} frames). Now propagating backward…")
+                self._start_propagation_run(
+                    keyframe_idx, start_idx, keyframe_idx,
+                    reverse=True, chain_backward=False
+                )
+                return
+        # All done
+        self._btn_prop_cancel.setEnabled(False)
+        self._update_propagation_buttons()
+        self._lbl_prop_progress.setText(f"Done — {n} frames propagated.")
+        self._lbl_prop_progress.setStyleSheet("color:#44CC44;font-size:8pt;")
+        self._log(f"Propagation complete: {n} frames added to annotation store.")
+
+    def _on_prop_error(self, msg: str):
+        self._btn_prop_cancel.setEnabled(False)
+        self._update_propagation_buttons()
+        self._lbl_prop_progress.setText(f"Error: {msg[:60]}")
+        self._lbl_prop_progress.setStyleSheet("color:#CC4444;font-size:8pt;")
+        self._log(f"ERROR during propagation: {msg}")
+
+    def _on_propagate_cancel(self):
+        if self._propagation_worker and self._propagation_worker.isRunning():
+            self._propagation_worker.cancel()
+        self._btn_prop_cancel.setEnabled(False)
+        self._update_propagation_buttons()
+        self._lbl_prop_progress.setText("Cancelled.")
+        self._lbl_prop_progress.setStyleSheet("color:#888888;font-size:8pt;")
+        self._log("Propagation cancelled.")
+
     def _on_load_gsam(self):
         """Load Grounding DINO + optional SAM in background."""
         self._btn_load_gsam.setEnabled(False)
@@ -3212,6 +3560,7 @@ class MainWindow(QMainWindow):
         self._undo_stacks.pop(self._current_frame_idx, None)
         self._redo_stacks.pop(self._current_frame_idx, None)
         self._update_auto_segment_btn()
+        self._update_propagation_buttons()
         self._refresh_display()
         self._log(
             f"Grounded SAM: {len(result.class_ids)} detection(s) "
@@ -3494,6 +3843,7 @@ class MainWindow(QMainWindow):
         self._btn_save_semantic.setEnabled(self._current_semantic is not None)
         self._frame_viewer.reset_zoom()
         self._update_auto_segment_btn()
+        self._update_propagation_buttons()
         self._refresh_display()
 
         total = self._video.total_frames()

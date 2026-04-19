@@ -26,6 +26,12 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 try:
+    from sam2.build_sam import build_sam2_video_predictor as _build_sam2_video_predictor
+    _SAM2_AVAILABLE = True
+except ImportError:
+    _SAM2_AVAILABLE = False
+
+try:
     from ultralytics import YOLO
     ULTRALYTICS_AVAILABLE = True
 except ImportError:
@@ -1080,3 +1086,213 @@ class SemanticSegmentationEngine:
             class_names=self._class_names,
             orig_shape=(orig_h, orig_w),
         )
+
+
+# ---------------------------------------------------------------------------
+# SAM 2 Temporal Propagation Engine
+# ---------------------------------------------------------------------------
+
+class SAM2PropagationEngine:
+    """
+    Wraps Meta's SAM 2 video predictor for temporal mask propagation.
+
+    Workflow
+    --------
+    1. ``load(checkpoint, variant)``  — load model weights once.
+    2. ``propagate(...)``             — extract frames to a temp dir, initialise
+       the video state with keyframe masks/boxes, propagate forward or backward,
+       return a dict mapping global_frame_idx → InferenceResult.
+
+    The caller owns the temp-dir lifetime; this class always cleans it up in a
+    finally block inside ``propagate``.
+    """
+
+    # Mapping from short variant name to Hydra config filename
+    CONFIGS = {
+        "tiny":   "sam2_hiera_tiny.yaml",
+        "small":  "sam2_hiera_small.yaml",
+        "base+":  "sam2_hiera_base_plus.yaml",
+        "large":  "sam2_hiera_large.yaml",
+    }
+    # Default checkpoint filenames for auto-download hint in UI
+    CHECKPOINTS = {
+        "tiny":   "sam2_hiera_tiny.pt",
+        "small":  "sam2_hiera_small.pt",
+        "base+":  "sam2_hiera_base_plus.pt",
+        "large":  "sam2_hiera_large.pt",
+    }
+
+    def __init__(self):
+        self._predictor = None
+        self._device    = "cuda" if (TORCH_AVAILABLE and torch.cuda.is_available()) else "cpu"
+
+    # ------------------------------------------------------------------
+
+    def is_loaded(self) -> bool:
+        return self._predictor is not None
+
+    def status(self) -> str:
+        if self._predictor is None:
+            return "Not loaded"
+        return f"Ready ({self._device.upper()})"
+
+    def load(self, checkpoint: str, variant: str = "tiny") -> "tuple[bool, str]":
+        """Load SAM 2 video predictor from *checkpoint*."""
+        if not _SAM2_AVAILABLE:
+            return False, "sam2 not installed.  Run: pip install sam2"
+        if not TORCH_AVAILABLE:
+            return False, "PyTorch not available."
+        cfg = self.CONFIGS.get(variant, "sam2_hiera_tiny.yaml")
+        try:
+            self._predictor = _build_sam2_video_predictor(
+                cfg, checkpoint, device=self._device
+            )
+            return True, f"SAM 2 ({variant}) loaded on {self._device.upper()}"
+        except Exception as exc:
+            self._predictor = None
+            return False, str(exc)
+
+    # ------------------------------------------------------------------
+
+    def propagate(
+        self,
+        video_path:       str,
+        keyframe_idx:     int,
+        keyframe_result:  "InferenceResult",
+        start_idx:        int,
+        end_idx:          int,
+        reverse:          bool = False,
+        progress_cb:      "callable | None" = None,
+        cancel_flag:      "list[bool] | None" = None,
+    ) -> "dict[int, InferenceResult]":
+        """
+        Propagate *keyframe_result* masks through frames [start_idx, end_idx].
+
+        Parameters
+        ----------
+        video_path      : absolute path to the source video file.
+        keyframe_idx    : global frame index of the annotated keyframe.
+        keyframe_result : InferenceResult holding the masks to propagate from.
+        start_idx       : first global frame index to include (inclusive).
+        end_idx         : last global frame index to include (inclusive).
+        reverse         : if True, propagate from keyframe *backward* to start_idx.
+        progress_cb     : optional callable(done: int, total: int).
+        cancel_flag     : mutable list[bool]; propagation stops if flag[0] is True.
+
+        Returns
+        -------
+        dict mapping global_frame_idx → InferenceResult for every propagated frame.
+        """
+        import shutil
+        import tempfile
+
+        if not self.is_loaded():
+            raise RuntimeError("SAM 2 predictor not loaded.")
+        if not keyframe_result.masks_binary and not keyframe_result.boxes_xyxy:
+            raise ValueError("Keyframe has no masks or boxes to propagate from.")
+
+        frame_indices = list(range(start_idx, end_idx + 1))
+        if keyframe_idx not in frame_indices:
+            raise ValueError(
+                f"keyframe_idx {keyframe_idx} is outside range "
+                f"[{start_idx}, {end_idx}]."
+            )
+        keyframe_local = frame_indices.index(keyframe_idx)
+
+        tmp_dir = tempfile.mkdtemp(prefix="ff_sam2_")
+        try:
+            # ── Step 1: extract frames to numbered JPEGs ──────────────────
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise RuntimeError(f"Cannot open video: {video_path}")
+            try:
+                for local_i, global_i in enumerate(frame_indices):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, float(global_i))
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        cv2.imwrite(
+                            os.path.join(tmp_dir, f"{local_i:05d}.jpg"), frame
+                        )
+            finally:
+                cap.release()
+
+            orig_h, orig_w = keyframe_result.orig_shape
+
+            # ── Step 2: initialise SAM 2 video state ─────────────────────
+            with torch.inference_mode():
+                state = self._predictor.init_state(video_path=tmp_dir)
+                self._predictor.reset_state(state)
+
+                # Add one SAM 2 object per detection in the keyframe
+                n_objects = len(keyframe_result.class_ids)
+                for obj_id in range(n_objects):
+                    if obj_id < len(keyframe_result.masks_binary):
+                        # Prefer mask prompt (pixel-accurate)
+                        m = keyframe_result.masks_binary[obj_id]
+                        bool_mask = (m > 0)
+                        self._predictor.add_new_mask(
+                            state,
+                            frame_idx=keyframe_local,
+                            obj_id=obj_id,
+                            mask=bool_mask,
+                        )
+                    elif obj_id < len(keyframe_result.boxes_xyxy):
+                        # Fall back to box prompt
+                        box = np.array(
+                            keyframe_result.boxes_xyxy[obj_id], dtype=np.float32
+                        )
+                        self._predictor.add_new_points_or_box(
+                            state,
+                            frame_idx=keyframe_local,
+                            obj_id=obj_id,
+                            box=box,
+                        )
+
+                # ── Step 3: propagate ─────────────────────────────────────
+                results: "dict[int, InferenceResult]" = {}
+                total = len(frame_indices)
+
+                for local_idx, obj_ids, mask_logits in \
+                        self._predictor.propagate_in_video(state, reverse=reverse):
+
+                    if cancel_flag and cancel_flag[0]:
+                        break
+
+                    global_idx = frame_indices[local_idx]
+
+                    boxes, class_ids, confs, masks, cnames = [], [], [], [], []
+                    for slot, obj_id in enumerate(obj_ids):
+                        if obj_id >= n_objects:
+                            continue
+                        # mask_logits shape: (N_objects, 1, H, W)
+                        m = (mask_logits[slot, 0] > 0.0).cpu().numpy()
+                        m_u8 = m.astype(np.uint8) * 255
+                        ys, xs = np.where(m)
+                        if len(xs) == 0:
+                            continue
+                        x1, y1 = int(xs.min()), int(ys.min())
+                        x2, y2 = int(xs.max()), int(ys.max())
+                        boxes.append([float(x1), float(y1), float(x2), float(y2)])
+                        class_ids.append(keyframe_result.class_ids[obj_id])
+                        confs.append(keyframe_result.confidences[obj_id])
+                        masks.append(m_u8)
+                        cnames.append(keyframe_result.class_names[obj_id])
+
+                    results[global_idx] = InferenceResult(
+                        boxes_xyxy   = boxes,
+                        class_ids    = class_ids,
+                        confidences  = confs,
+                        masks_binary = masks,
+                        class_names  = cnames,
+                        orig_shape   = (orig_h, orig_w),
+                    )
+
+                    if progress_cb:
+                        progress_cb(local_idx + 1, total)
+
+            return results
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if TORCH_AVAILABLE and torch.cuda.is_available():
+                torch.cuda.empty_cache()

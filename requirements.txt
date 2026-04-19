@@ -12,3 +12,8 @@ Pillow>=10.2.0
 
 # Semantic segmentation (optional — SegFormer)
 # pip install transformers>=4.38        # same package as above
+
+# Temporal propagation (optional — SAM 2)
+# pip install sam2
+# Download checkpoints from:
+# https://github.com/facebookresearch/segment-anything-2/releases
