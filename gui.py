@@ -1683,6 +1683,12 @@ class MainWindow(QMainWindow):
         self._current_result:     InferenceResult | None  = None
         self._output_dir:         str                     = ""
         self._is_playing:         bool                    = False
+
+        # Render caches — avoid redundant CPU work on identical frames
+        self._overlay_cache_key:  "tuple | None"          = None
+        self._overlay_cache_img:  "np.ndarray | None"     = None
+        self._show_bgr_cache_id:  "int | None"            = None
+        self._show_bgr_cache_rgb: "np.ndarray | None"     = None
         self._last_infer_time:    float                   = 0.0
         self._last_frame_time:    float                   = 0.0
         self._fps_window:         deque                   = deque(maxlen=10)
@@ -3880,13 +3886,21 @@ class MainWindow(QMainWindow):
         # ── Instance view (default) ──────────────────────────────────────
         if (self._current_result is not None
                 and self._chk_show_overlay.isChecked()):
-            display_result = ExportHandler.filter_result(
-                self._current_result, self._enabled_classes
+            # Cache the overlay: only recompute when frame/result/filter changes
+            cache_key = (
+                id(self._current_frame_bgr),
+                id(self._current_result),
+                frozenset(self._enabled_classes) if self._enabled_classes is not None else None,
             )
-            annotated = self._engine.draw_overlay(
-                self._current_frame_bgr, display_result
-            )
-            self._show_bgr(annotated)
+            if cache_key != self._overlay_cache_key:
+                display_result = ExportHandler.filter_result(
+                    self._current_result, self._enabled_classes
+                )
+                self._overlay_cache_img = self._engine.draw_overlay(
+                    self._current_frame_bgr, display_result
+                )
+                self._overlay_cache_key = cache_key
+            self._show_bgr(self._overlay_cache_img)
         else:
             self._show_bgr(self._current_frame_bgr)
 
@@ -3899,9 +3913,13 @@ class MainWindow(QMainWindow):
                 )
 
     def _show_bgr(self, frame_bgr: np.ndarray):
-        """Convert BGR numpy frame to QPixmap and display it."""
-        h, w = frame_bgr.shape[:2]
-        rgb  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        """Convert BGR numpy frame to QPixmap and display it (cached RGB)."""
+        h, w    = frame_bgr.shape[:2]
+        frame_id = id(frame_bgr)
+        if frame_id != self._show_bgr_cache_id:
+            self._show_bgr_cache_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            self._show_bgr_cache_id  = frame_id
+        rgb  = self._show_bgr_cache_rgb
         qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888)
         self._frame_viewer.set_frame_pixmap(QPixmap.fromImage(qimg))
 
@@ -4015,19 +4033,16 @@ class MainWindow(QMainWindow):
             return
         try:
             session: dict = {
+                "version":       2,   # v2: masks stored as raw bytes (not PNG)
                 "known_classes": {str(k): v for k, v in self._known_classes.items()},
                 "frames": {},
             }
             for fid, result in self._frame_store.items():
-                masks_b64 = []
-                for m in result.masks_binary:
-                    ok, buf = cv2.imencode(".png", m)
-                    if ok:
-                        masks_b64.append(
-                            base64.b64encode(buf.tobytes()).decode("ascii")
-                        )
-                    else:
-                        masks_b64.append("")
+                # Raw bytes is ~10x faster than PNG encode and lossless
+                masks_b64 = [
+                    base64.b64encode(m.tobytes()).decode("ascii")
+                    for m in result.masks_binary
+                ]
                 session["frames"][str(fid)] = {
                     "boxes_xyxy":   result.boxes_xyxy,
                     "class_ids":    result.class_ids,
@@ -4057,20 +4072,26 @@ class MainWindow(QMainWindow):
             for k, v in data.get("known_classes", {}).items():
                 self._known_classes[int(k)] = v
             # Restore frame store
+            session_version = data.get("version", 1)
             self._frame_store.clear()
             for fid_str, entry in data.get("frames", {}).items():
                 masks = []
+                sh, sw = entry["orig_shape"]
                 for b64 in entry.get("masks_binary", []):
                     if b64:
-                        buf = np.frombuffer(
-                            base64.b64decode(b64), dtype=np.uint8
-                        )
-                        m = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
-                        if m is not None:
-                            masks.append(m)
-                            continue
-                    h, w = entry["orig_shape"]
-                    masks.append(np.zeros((h, w), dtype=np.uint8))
+                        raw = base64.b64decode(b64)
+                        if session_version >= 2:
+                            # v2: raw uint8 bytes, reshape using orig_shape
+                            m = np.frombuffer(raw, dtype=np.uint8).reshape(sh, sw).copy()
+                        else:
+                            # v1 (legacy): PNG-encoded grayscale
+                            buf = np.frombuffer(raw, dtype=np.uint8)
+                            m   = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
+                            if m is None:
+                                m = np.zeros((sh, sw), dtype=np.uint8)
+                        masks.append(m)
+                    else:
+                        masks.append(np.zeros((sh, sw), dtype=np.uint8))
                 self._frame_store[int(fid_str)] = InferenceResult(
                     boxes_xyxy  = entry["boxes_xyxy"],
                     class_ids   = entry["class_ids"],

@@ -47,6 +47,28 @@ class ExportHandler:
         """Initialise with no output directory configured."""
         self._output_dir: Path | None = None
         self._coco_annotation_id: int = 1
+        # In-memory caches so batch export never re-reads JSON from disk
+        self._coco_cache: "dict | None" = None
+        self._ls_cache:   "list | None" = None
+
+    # ------------------------------------------------------------------ #
+    # Contour helper — compute ONCE per mask, reused across all 4 formats  #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _mask_contours(mask: np.ndarray) -> "list[np.ndarray]":
+        """Return contours for *mask*, largest first.  Empty list if none."""
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            return []
+        return sorted(contours, key=cv2.contourArea, reverse=True)
+
+    @staticmethod
+    def _contour_to_flat(contour: np.ndarray) -> "list[float]":
+        """Flatten contour array to [x0,y0,x1,y1,...] using numpy (fast)."""
+        return contour.reshape(-1).astype(float).tolist()
 
     # ------------------------------------------------------------------ #
 
@@ -76,6 +98,9 @@ class ExportHandler:
             )
             raise
         self._output_dir = p
+        # Invalidate JSON caches when output dir changes
+        self._coco_cache = None
+        self._ls_cache   = None
 
     # ------------------------------------------------------------------ #
 
@@ -254,22 +279,26 @@ class ExportHandler:
         h, w = frame_bgr.shape[:2]
         lines: list[str] = []
 
+        # Pre-compute contours once per mask — reused if multiple formats exported
+        mask_contours = [
+            self._mask_contours(result.masks_binary[i])
+            if i < len(result.masks_binary) and result.masks_binary[i] is not None
+            else []
+            for i in range(len(result.class_ids))
+        ]
+
         for i, class_id in enumerate(result.class_ids):
             wrote_polygon = False
-            if i < len(result.masks_binary) and result.masks_binary[i] is not None:
-                mask = result.masks_binary[i]
-                contours, _ = cv2.findContours(
-                    mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            contours = mask_contours[i]
+            if contours:
+                contour = contours[0]   # already sorted largest-first
+                step    = max(1, len(contour) // 50)
+                pts     = contour[::step].reshape(-1, 2)
+                coords  = " ".join(
+                    f"{pt[0] / w:.6f} {pt[1] / h:.6f}" for pt in pts
                 )
-                if contours:
-                    contour = max(contours, key=cv2.contourArea)
-                    step    = max(1, len(contour) // 50)
-                    pts     = contour[::step].reshape(-1, 2)
-                    coords  = " ".join(
-                        f"{pt[0] / w:.6f} {pt[1] / h:.6f}" for pt in pts
-                    )
-                    lines.append(f"{class_id} {coords}")
-                    wrote_polygon = True
+                lines.append(f"{class_id} {coords}")
+                wrote_polygon = True
 
             if not wrote_polygon and i < len(result.boxes_xyxy):
                 x1, y1, x2, y2 = result.boxes_xyxy[i]
@@ -319,15 +348,18 @@ class ExportHandler:
         coco_path = self._output_dir / "coco" / "annotations.json"
         h, w = frame_bgr.shape[:2]
 
-        if coco_path.exists():
-            try:
-                with coco_path.open("r", encoding="utf-8") as fh:
-                    coco_data: dict = json.load(fh)
-            except (json.JSONDecodeError, OSError):
-                logger.warning("annotations.json corrupted — starting fresh.")
-                coco_data = {"images": [], "annotations": [], "categories": []}
-        else:
-            coco_data = {"images": [], "annotations": [], "categories": []}
+        # In-memory cache: read JSON from disk only once per session
+        if self._coco_cache is None:
+            if coco_path.exists():
+                try:
+                    with coco_path.open("r", encoding="utf-8") as fh:
+                        self._coco_cache = json.load(fh)
+                except (json.JSONDecodeError, OSError):
+                    logger.warning("annotations.json corrupted — starting fresh.")
+                    self._coco_cache = {"images": [], "annotations": [], "categories": []}
+            else:
+                self._coco_cache = {"images": [], "annotations": [], "categories": []}
+        coco_data = self._coco_cache
 
         if coco_data["annotations"]:
             max_existing = max(a["id"] for a in coco_data["annotations"])
@@ -355,21 +387,23 @@ class ExportHandler:
             a for a in coco_data["annotations"] if a["image_id"] != frame_idx
         ]
 
+        # Pre-compute contours once per mask
+        mask_contours = [
+            self._mask_contours(result.masks_binary[i])
+            if i < len(result.masks_binary) and result.masks_binary[i] is not None
+            else []
+            for i in range(len(result.class_ids))
+        ]
+
         for i, class_id in enumerate(result.class_ids):
             segmentation: list[list[float]] = []
             area: float = 0.0
 
-            if i < len(result.masks_binary) and result.masks_binary[i] is not None:
-                mask = result.masks_binary[i]
-                contours, _ = cv2.findContours(
-                    mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                )
-                for cnt in contours:
-                    area += float(cv2.contourArea(cnt))
-                    flat = [float(v) for pt in cnt.reshape(-1, 2).tolist()
-                            for v in pt]
-                    if len(flat) >= 6:
-                        segmentation.append(flat)
+            for cnt in mask_contours[i]:
+                area += float(cv2.contourArea(cnt))
+                flat = self._contour_to_flat(cnt)   # vectorized numpy flatten
+                if len(flat) >= 6:
+                    segmentation.append(flat)
 
             if i < len(result.boxes_xyxy):
                 x1, y1, x2, y2 = result.boxes_xyxy[i]
@@ -471,6 +505,14 @@ class ExportHandler:
         img_el.set("height", str(h))
         img_el.set("source", video_name)
 
+        # Pre-compute contours once per mask
+        mask_contours = [
+            self._mask_contours(result.masks_binary[i])
+            if i < len(result.masks_binary) and result.masks_binary[i] is not None
+            else []
+            for i in range(len(result.class_ids))
+        ]
+
         for i, class_id in enumerate(result.class_ids):
             cname = (result.class_names[i]
                      if i < len(result.class_names) else str(class_id))
@@ -478,26 +520,22 @@ class ExportHandler:
                      if i < len(result.confidences) else 1.0)
 
             wrote_polygon = False
-            if i < len(result.masks_binary) and result.masks_binary[i] is not None:
-                mask = result.masks_binary[i]
-                contours, _ = cv2.findContours(
-                    mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            contours = mask_contours[i]
+            if contours:
+                contour  = contours[0]   # largest first
+                step     = max(1, len(contour) // 50)
+                pts      = contour[::step].reshape(-1, 2)
+                pts_str  = ";".join(
+                    f"{pt[0]:.2f},{pt[1]:.2f}" for pt in pts
                 )
-                if contours:
-                    contour  = max(contours, key=cv2.contourArea)
-                    step     = max(1, len(contour) // 50)
-                    pts      = contour[::step].reshape(-1, 2)
-                    pts_str  = ";".join(
-                        f"{pt[0]:.2f},{pt[1]:.2f}" for pt in pts
-                    )
-                    poly_el  = ET.SubElement(img_el, "polygon")
-                    poly_el.set("label",    cname)
-                    poly_el.set("points",   pts_str)
-                    poly_el.set("occluded", "0")
-                    poly_el.set("source",   "auto")
-                    poly_el.set("z_order",  "0")
-                    poly_el.set("conf",     f"{conf:.4f}")
-                    wrote_polygon = True
+                poly_el  = ET.SubElement(img_el, "polygon")
+                poly_el.set("label",    cname)
+                poly_el.set("points",   pts_str)
+                poly_el.set("occluded", "0")
+                poly_el.set("source",   "auto")
+                poly_el.set("z_order",  "0")
+                poly_el.set("conf",     f"{conf:.4f}")
+                wrote_polygon = True
 
             if not wrote_polygon and i < len(result.boxes_xyxy):
                 x1, y1, x2, y2 = result.boxes_xyxy[i]
@@ -575,19 +613,30 @@ class ExportHandler:
         h, w    = frame_bgr.shape[:2]
         fname   = f"frame_{frame_idx:06d}.jpg"
 
-        if ls_path.exists():
-            try:
-                with ls_path.open("r", encoding="utf-8") as fh:
-                    tasks: list = json.load(fh)
-            except (json.JSONDecodeError, OSError):
-                tasks = []
-        else:
-            tasks = []
+        # In-memory cache: read JSON from disk only once per session
+        if self._ls_cache is None:
+            if ls_path.exists():
+                try:
+                    with ls_path.open("r", encoding="utf-8") as fh:
+                        self._ls_cache = json.load(fh)
+                except (json.JSONDecodeError, OSError):
+                    self._ls_cache = []
+            else:
+                self._ls_cache = []
+        tasks = self._ls_cache
 
         # Remove stale entry (idempotent re-saves)
         tasks = [
             t for t in tasks
             if t.get("data", {}).get("image", "").split("/")[-1] != fname
+        ]
+
+        # Pre-compute contours once per mask
+        mask_contours = [
+            self._mask_contours(result.masks_binary[i])
+            if i < len(result.masks_binary) and result.masks_binary[i] is not None
+            else []
+            for i in range(len(result.class_ids))
         ]
 
         annotation_results: list[dict] = []
@@ -599,31 +648,27 @@ class ExportHandler:
             uid   = f"ann_{frame_idx}_{i}"
 
             wrote_polygon = False
-            if i < len(result.masks_binary) and result.masks_binary[i] is not None:
-                mask = result.masks_binary[i]
-                contours, _ = cv2.findContours(
-                    mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                )
-                if contours:
-                    contour = max(contours, key=cv2.contourArea)
-                    step    = max(1, len(contour) // 50)
-                    pts     = contour[::step].reshape(-1, 2)
-                    # LabelStudio polygon uses percentage coordinates
-                    points  = [
-                        [float(pt[0]) / w * 100.0, float(pt[1]) / h * 100.0]
-                        for pt in pts
-                    ]
-                    annotation_results.append({
-                        "id": uid, "type": "polygonlabels",
-                        "from_name": "label", "to_name": "image",
-                        "original_width": w, "original_height": h,
-                        "value": {
-                            "points": points,
-                            "polygonlabels": [cname],
-                            "confidence": conf,
-                        },
-                    })
-                    wrote_polygon = True
+            contours = mask_contours[i]
+            if contours:
+                contour = contours[0]   # largest first
+                step    = max(1, len(contour) // 50)
+                pts     = contour[::step].reshape(-1, 2)
+                # LabelStudio polygon uses percentage coordinates
+                points  = [
+                    [float(pt[0]) / w * 100.0, float(pt[1]) / h * 100.0]
+                    for pt in pts
+                ]
+                annotation_results.append({
+                    "id": uid, "type": "polygonlabels",
+                    "from_name": "label", "to_name": "image",
+                    "original_width": w, "original_height": h,
+                    "value": {
+                        "points": points,
+                        "polygonlabels": [cname],
+                        "confidence": conf,
+                    },
+                })
+                wrote_polygon = True
 
             if not wrote_polygon and i < len(result.boxes_xyxy):
                 x1, y1, x2, y2 = result.boxes_xyxy[i]

@@ -304,11 +304,14 @@ class InferenceEngine:
 
         if result.masks is not None and len(result.masks) > 0:
             for mask_tensor in result.masks.data:
-                # mask_tensor: float32 Tensor of shape (H', W')
                 mask_np = mask_tensor.cpu().numpy()
-                mask_resized = cv2.resize(
-                    mask_np, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST
-                )
+                # Skip resize if already at target resolution
+                if mask_np.shape == (orig_h, orig_w):
+                    mask_resized = mask_np
+                else:
+                    mask_resized = cv2.resize(
+                        mask_np, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST
+                    )
                 binary = (mask_resized > 0.5).astype(np.uint8) * 255
                 masks_binary.append(binary)
 
@@ -358,12 +361,10 @@ class InferenceEngine:
             mask_bool = mask > 0
             if not mask_bool.any():
                 continue
-            # cv2.addWeighted on the masked region only
-            color_layer          = np.empty_like(annotated)
-            color_layer[:]       = color
             region               = annotated[mask_bool]
+            color_u16            = np.array(color, dtype=np.uint16)
             annotated[mask_bool] = (
-                (region.astype(np.uint16) * 55 + np.array(color, dtype=np.uint16) * 45) // 100
+                (region.astype(np.uint16) * 55 + color_u16 * 45) // 100
             ).astype(np.uint8)
 
         # Pass 2: draw bounding boxes and labels on top
